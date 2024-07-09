@@ -20,3 +20,8 @@ sbibm
 geomstats
 pyevtk
 libigl
+
+
+
+einops
+scikit-image
