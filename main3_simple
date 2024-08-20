@@ -2,15 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from torch.optim.lr_scheduler import OneCycleLR
-from torch.amp import autocast
-from einops import rearrange
-from fff.loss import fff_loss
 from torchvision import transforms
-import numpy as np
-from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+from fff.loss import fff_loss
 from PIL import Image
 import os
+import numpy as np
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -22,67 +18,53 @@ class ConvBlock(nn.Module):
     def forward(self, x):
         return self.activation(self.norm(self.conv(x)))
 
-class SimpleConvEncoder(nn.Module):
-    def __init__(self, in_channels=3, latent_dim=256):
+class FreeFormFlow(nn.Module):
+    def __init__(self, in_channels=3, latent_dim=256, out_channels=3, scale_factor=4):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.conv1 = ConvBlock(in_channels, 64)
-        self.conv2 = ConvBlock(64, 128)
-        self.conv3 = ConvBlock(128, 256)
-        self.pool = nn.MaxPool2d(2)
-        self.flatten = nn.Flatten()
-        self.fc = nn.Linear(256 * 8 * 8, self.latent_dim)  # Angepasst für 64x64 Eingabe
-
-    def forward(self, x):
-        x = self.pool(self.conv1(x))
-        x = self.pool(self.conv2(x))
-        x = self.pool(self.conv3(x))
-        x = self.flatten(x)
-        return self.fc(x)
-
-class SimpleConvDecoder(nn.Module):
-    def __init__(self, latent_dim=256, out_channels=3, scale_factor=4):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.out_channels = out_channels
-        self.scale_factor = scale_factor
-        self.fc = nn.Linear(latent_dim, 256 * 8 * 8)
-        self.conv1 = ConvBlock(256, 128)
-        self.conv2 = ConvBlock(128, 64)
-        self.conv3 = ConvBlock(64, 32)
-        self.conv4 = nn.Conv2d(32, out_channels, kernel_size=3, padding=1)
-        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-
-    def forward(self, x):
-        x = self.fc(x).view(-1, 256, 8, 8)
-        x = self.upsample(self.conv1(x))
-        x = self.upsample(self.conv2(x))
-        x = self.upsample(self.conv3(x))
-        x = self.conv4(x)
-        return torch.tanh(x)
-
-class FreeFormFlowUpscaler(nn.Module):
-    def __init__(self, encoder, decoder, latent_dim=256, scale_factor=4):
-        super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
         self.latent_dim = latent_dim
         self.scale_factor = scale_factor
+        
+        # Encoder
+        self.encoder = nn.Sequential(
+            ConvBlock(in_channels, 64),
+            nn.MaxPool2d(2),
+            ConvBlock(64, 128),
+            nn.MaxPool2d(2),
+            ConvBlock(128, 256),
+            nn.MaxPool2d(2),
+            nn.Flatten(),
+            nn.Linear(256 * 8 * 8, latent_dim)
+        )
+        
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 256 * 8 * 8),
+            nn.Unflatten(1, (256, 8, 8)),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            ConvBlock(256, 128),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            ConvBlock(128, 64),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            ConvBlock(64, 32),
+            nn.Conv2d(32, out_channels, kernel_size=3, padding=1),
+            nn.Tanh()
+        )
+        
         self.latent_distribution = torch.distributions.Normal(
             loc=torch.zeros(latent_dim),
             scale=torch.ones(latent_dim)
         )
-    
+
     def forward(self, x):
         z = self.encoder(x)
         return self.decoder(z)
 
-    def encode(self, x):
-        return self.encoder(x)
+    def to(self, device):
+        super().to(device)
+        self.latent_distribution.loc = self.latent_distribution.loc.to(device)
+        self.latent_distribution.scale = self.latent_distribution.scale.to(device)
+        return self
 
-    def decode(self, z):
-        return self.decoder(z)
-    
 class DIV2KDataset(Dataset):
     def __init__(self, hr_dir, crop_size=256, scale_factor=0.25):
         self.hr_dir = hr_dir
@@ -103,82 +85,10 @@ class DIV2KDataset(Dataset):
         
         hr_img = self.transform(hr_img)
         
-        # Erzeuge das LR-Bild on-the-fly
         lr_size = int(self.crop_size * self.scale_factor)
         lr_img = F.interpolate(hr_img.unsqueeze(0), size=(lr_size, lr_size), mode='bicubic', align_corners=False).squeeze(0)
 
         return lr_img, hr_img
-    
-def psnr(img1, img2):
-    return peak_signal_noise_ratio(img1.cpu().numpy(), img2.cpu().numpy())
-
-def ssim(img1, img2):
-    return structural_similarity(img1.cpu().numpy(), img2.cpu().numpy(), multichannel=True)
-
-def train(model, train_loader, val_loader, optimizer, scheduler, scaler, beta, device, epochs):
-    model.train()
-    best_val_psnr = 0
-    for epoch in range(epochs):
-        train_loss = 0
-        for batch in train_loader:
-            low_res, high_res = batch
-            low_res, high_res = low_res.to(device), high_res.to(device)
-            
-            optimizer.zero_grad()
-            with autocast(device_type='cuda', dtype=torch.float32):
-                z = model.encode(low_res)
-                output = model.decode(z)
-                
-                # FFF Verlust auf niedrig aufgelösten Bildern
-                fff_loss_value = fff_loss(
-                    low_res, 
-                    model.encode, 
-                    lambda z: F.interpolate(model.decode(z), size=low_res.shape[2:], mode='bilinear', align_corners=False),
-                    model.latent_distribution, 
-                    beta,
-                    hutchinson_samples=1
-                )
-                
-                # Resize high_res to match output of model
-                high_res = F.interpolate(high_res, size=(128, 128), mode='bicubic')
-                output = model(low_res)
-                
-                # MSE Verlust auf hoch aufgelösten Bildern
-                mse_loss = F.mse_loss(output, high_res)
-                
-                loss = fff_loss_value.mean() + mse_loss
-            
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            
-            train_loss += loss.item()
-        
-        train_loss /= len(train_loader)
-        val_psnr, val_ssim = evaluate(model, val_loader, device)
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val PSNR: {val_psnr:.2f}, Val SSIM: {val_ssim:.4f}")
-        
-        if val_psnr > best_val_psnr:
-            best_val_psnr = val_psnr
-            torch.save(model.state_dict(), 'best_fff_upscaler.pth')
-
-def evaluate(model, val_loader, device):
-    model.eval()
-    psnr_values = []
-    ssim_values = []
-    with torch.no_grad():
-        for low_res, high_res in val_loader:
-            low_res, high_res = low_res.to(device), high_res.to(device)
-            output = model(low_res)
-            psnr_values.append(psnr(output, high_res))
-            ssim_values.append(ssim(output, high_res))
-    return np.mean(psnr_values), np.mean(ssim_values)
-
-def upscale(model, low_res_image):
-    model.eval()
-    with torch.no_grad():
-        return model(low_res_image)
 
 def custom_collate(batch):
     lr_imgs, hr_imgs = zip(*batch)
@@ -187,47 +97,52 @@ def custom_collate(batch):
     return lr_imgs, hr_imgs
 
 if __name__ == "__main__":
-    print(torch.cuda.is_available())
-    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-                                
-    # Pfad zum DIV2K-Datensatz (nur HR benötigt)
+    
+    # Datensatz und DataLoader
     train_hr_dir = 'C:/Users/Admin/Desktop/DIV2K_train_HR'
     val_hr_dir = 'C:/Users/Admin/Desktop/DIV2K_valid_HR'
-
-    # Datensatz und DataLoader
     train_dataset = DIV2KDataset(train_hr_dir, crop_size=256, scale_factor=0.25)
     val_dataset = DIV2KDataset(val_hr_dir, crop_size=256, scale_factor=0.25)
     train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4, collate_fn=custom_collate)
     val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4, collate_fn=custom_collate)
- 
-    # Modell auswählen
-    latent_dim = 256
-    model = FreeFormFlowUpscaler(
-        SimpleConvEncoder(in_channels=3, latent_dim=latent_dim),
-        SimpleConvDecoder(latent_dim=latent_dim, out_channels=3, scale_factor=4),
-        latent_dim=latent_dim,
-        scale_factor=4
-    ).to(device)
-   # model.apply(init_weights)
-    
-    # Optimierer und Scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
-    num_epochs = 50
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.01, steps_per_epoch=len(train_loader), epochs=num_epochs)
 
-        # GradScaler für Mixed Precision Training
-    scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
-    
-    # Training
-    try:
-        train(model, train_loader, val_loader, optimizer, scheduler, scaler, beta=1.0, device=device, epochs=num_epochs)
-    except KeyboardInterrupt:
-        print("Training interrupted. Saving current model state.")
-    finally:
-        torch.save(model.state_dict(), 'final_fff_upscaler.pth')
-    
-    # Beispiel für Upscaling (dtype=torch.float32)
-    test_image = torch.randn(1, 3, 32, 32).to(device)
-    upscaled_image = upscale(model, test_image)
-    print(f"Upscaled image shape: {upscaled_image.shape}")
+    # Modell, Optimierer und andere Hyperparameter
+    model = FreeFormFlow(scale_factor=4).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+    n_epochs = 50
+    beta = 1.0
+
+    # Training Loop
+    for epoch in range(n_epochs):
+        model.train()
+        train_loss = 0
+        for batch in train_loader:
+            low_res, high_res = batch
+            low_res, high_res = low_res.to(device), high_res.to(device)
+            
+            optimizer.zero_grad()
+            
+            loss = fff_loss(
+                low_res, 
+                model.encoder, 
+                lambda z: F.interpolate(model.decoder(z), size=low_res.shape[2:], mode='bilinear', align_corners=False),
+                model.latent_distribution, 
+                beta,
+                hutchinson_samples=1
+            )
+            
+            output = model(low_res)
+            output_resized = F.interpolate(output, size=high_res.shape[2:], mode='bilinear', align_corners=False)
+            mse_loss = F.mse_loss(output_resized, high_res)
+            total_loss = loss.mean() + mse_loss
+            
+            total_loss.backward()
+            optimizer.step()
+            
+            train_loss += total_loss.item()
+        
+        train_loss /= len(train_loader)
+        print(f"Epoch {epoch+1}/{n_epochs}, Train Loss: {train_loss:.4f}")
+
+    torch.save(model.state_dict(), 'final_fff_upscaler.pth')
