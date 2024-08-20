@@ -29,34 +29,53 @@ class ConvBlock(nn.Module):
 class SimpleConvEncoder(nn.Module):
     def __init__(self, in_channels=3, latent_dim=256):
         super().__init__()
+        self.latent_dim = latent_dim
         self.conv1 = ConvBlock(in_channels, 64)
         self.conv2 = ConvBlock(64, 128)
         self.conv3 = ConvBlock(128, 256)
         self.pool = nn.MaxPool2d(2)
         self.flatten = nn.Flatten()
-        self.fc = nn.Linear(256 * 4 * 4, latent_dim)
+        self.fc = None  # Will be initialized in forward pass
 
     def forward(self, x):
+        print(f"Encoder input shape: {x.shape}")
         x = self.pool(self.conv1(x))
+        print(f"After conv1 and pool: {x.shape}")
         x = self.pool(self.conv2(x))
+        print(f"After conv2 and pool: {x.shape}")
         x = self.pool(self.conv3(x))
+        print(f"After conv3 and pool: {x.shape}")
         x = self.flatten(x)
+        print(f"After flatten: {x.shape}")
+        if self.fc is None:
+            self.fc = nn.Linear(x.shape[1], self.latent_dim)
         return self.fc(x)
 
 class SimpleConvDecoder(nn.Module):
     def __init__(self, latent_dim=256, out_channels=3):
         super().__init__()
-        self.fc = nn.Linear(latent_dim, 256 * 4 * 4)
+        self.latent_dim = latent_dim
+        self.out_channels = out_channels
+        self.fc = None
         self.conv1 = ConvBlock(256, 128)
         self.conv2 = ConvBlock(128, 64)
-        self.conv3 = nn.Conv2d(64, out_channels, kernel_size=3, padding=1)
+        self.conv3 = ConvBlock(64, 32)
+        self.conv4 = nn.Conv2d(32, out_channels, kernel_size=3, padding=1)
         self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
 
     def forward(self, x):
+        if self.fc is None:
+            self.fc = nn.Linear(self.latent_dim, 256 * 4 * 4)
         x = self.fc(x).view(-1, 256, 4, 4)
+        print(f"Decoder input shape after fc: {x.shape}")
         x = self.upsample(self.conv1(x))
+        print(f"After conv1 and upsample: {x.shape}")
         x = self.upsample(self.conv2(x))
+        print(f"After conv2 and upsample: {x.shape}")
         x = self.upsample(self.conv3(x))
+        print(f"After conv3 and upsample: {x.shape}")
+        x = self.upsample(self.conv4(x))
+        print(f"Decoder output shape: {x.shape}")
         return torch.tanh(x)
 
 class ResidualBlock(nn.Module):
@@ -194,10 +213,15 @@ class TransformerDecoder(nn.Module):
         return torch.tanh(x)
 
 class FreeFormFlowUpscaler(nn.Module):
-    def __init__(self, encoder, decoder):
+    def __init__(self, encoder, decoder, latent_dim=256):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.latent_dim = latent_dim
+        self.latent_distribution = torch.distributions.Normal(
+            loc=torch.zeros(latent_dim),
+            scale=torch.ones(latent_dim)
+        )
     
     def forward(self, x):
         z = self.encoder(x)
@@ -210,17 +234,18 @@ def init_weights(m):
         nn.init.constant_(m.weight, 1)
         nn.init.constant_(m.bias, 0)
         
-class CustomDataset(Dataset):
-    def __init__(self, root_dir, transform=None):
-        self.dataset = ImageFolder(root_dir, transform=transform)
+# class CustomDataset(Dataset):
+#     def __init__(self, root_dir, transform=None):
+#         self.dataset = ImageFolder(root_dir, transform=transform)
         
-    def __len__(self):
-        return len(self.dataset)
+#     def __len__(self):
+#         return len(self.dataset)
     
-    def __getitem__(self, idx):
-        img, _ = self.dataset[idx]
-        low_res = F.interpolate(img.unsqueeze(0), scale_factor=0.5, mode='bicubic').squeeze(0)
-        return low_res, img
+#     def __getitem__(self, idx):
+#         img, _ = self.dataset[idx]
+#         low_res = F.interpolate(img.unsqueeze(0), scale_factor=0.5, mode='bicubic').squeeze(0)
+#         print(f"HR image shape: {hr_img.shape}, LR image shape: {lr_img.shape}")
+#         return lr_img, hr_img
     
 class DIV2KDataset(Dataset):
     def __init__(self, hr_dir, crop_size=256, scale_factor=0.25):
@@ -265,7 +290,16 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, beta, d
             optimizer.zero_grad()
             with autocast():
                 output = model(low_res)
-                loss = fff_loss(low_res, model.encoder, model.decoder, beta) + F.mse_loss(output, high_res)
+                fff_loss_value = fff_loss(
+                    low_res, 
+                    model.encoder, 
+                    model.decoder, 
+                    model.latent_distribution, 
+                    beta,
+                    hutchinson_samples=1
+                )
+                mse_loss = F.mse_loss(output, high_res)
+                loss = fff_loss_value.mean() + mse_loss
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -319,7 +353,12 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4, collate_fn=custom_collate)
   
     # Modell auswählen
-    model = FreeFormFlowUpscaler(SimpleConvEncoder(), SimpleConvDecoder()).to(device)
+    latent_dim = 256
+    model = FreeFormFlowUpscaler(
+        SimpleConvEncoder(in_channels=3, latent_dim=latent_dim),
+        SimpleConvDecoder(latent_dim=latent_dim, out_channels=3),
+        latent_dim=latent_dim
+    ).to(device)
    # model.apply(init_weights)
     
     # Optimierer und Scheduler
@@ -328,7 +367,7 @@ if __name__ == "__main__":
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.01, steps_per_epoch=len(train_loader), epochs=num_epochs)
 
         # GradScaler für Mixed Precision Training
-    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+    scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
     
     # Training
     try:
