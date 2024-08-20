@@ -32,14 +32,13 @@ class FreeFormFlow(nn.Module):
             nn.MaxPool2d(2),
             ConvBlock(128, 256),
             nn.MaxPool2d(2),
-            nn.Flatten(),
-            nn.Linear(256 * 8 * 8, latent_dim)
+            ConvBlock(256, latent_dim),
+            nn.AdaptiveAvgPool2d((1, 1))
         )
         
         # Decoder
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 256 * 8 * 8),
-            nn.Unflatten(1, (256, 8, 8)),
+            nn.Conv2d(latent_dim, 256, kernel_size=1),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
             ConvBlock(256, 128),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
@@ -57,6 +56,14 @@ class FreeFormFlow(nn.Module):
 
     def forward(self, x):
         z = self.encoder(x)
+        z = z.view(z.size(0), self.latent_dim, 1, 1)
+        return self.decoder(z)
+
+    def encode(self, x):
+        return self.encoder(x).view(x.size(0), self.latent_dim)
+
+    def decode(self, z):
+        z = z.view(z.size(0), self.latent_dim, 1, 1)
         return self.decoder(z)
 
     def to(self, device):
