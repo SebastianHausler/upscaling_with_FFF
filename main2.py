@@ -223,11 +223,15 @@ class CustomDataset(Dataset):
         return low_res, img
     
 class DIV2KDataset(Dataset):
-    def __init__(self, hr_dir, transform=None, scale_factor=0.25):
+    def __init__(self, hr_dir, crop_size=256, scale_factor=0.25):
         self.hr_dir = hr_dir
-        self.transform = transform
+        self.crop_size = crop_size
         self.scale_factor = scale_factor
         self.image_files = [f for f in os.listdir(hr_dir) if f.endswith('.png')]
+        self.transform = transforms.Compose([
+            transforms.RandomCrop(crop_size),
+            transforms.ToTensor(),
+        ])
 
     def __len__(self):
         return len(self.image_files)
@@ -235,10 +239,9 @@ class DIV2KDataset(Dataset):
     def __getitem__(self, idx):
         img_name = self.image_files[idx]
         hr_img = Image.open(os.path.join(self.hr_dir, img_name))
-
-        if self.transform:
-            hr_img = self.transform(hr_img)
-
+        
+        hr_img = self.transform(hr_img)
+        
         # Erzeuge das LR-Bild on-the-fly
         lr_img = F.interpolate(hr_img.unsqueeze(0), scale_factor=self.scale_factor, mode='bicubic').squeeze(0)
 
@@ -296,34 +299,36 @@ def upscale(model, low_res_image):
     with torch.no_grad():
         return model(low_res_image)
 
+def custom_collate(batch):
+    lr_imgs, hr_imgs = zip(*batch)
+    lr_imgs = torch.stack(lr_imgs)
+    hr_imgs = torch.stack(hr_imgs)
+    return lr_imgs, hr_imgs
+
 if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Datentransformationen
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-    ])
-
                                 
     # Pfad zum DIV2K-Datensatz (nur HR benötigt)
     train_hr_dir = 'C:/Users/Admin/Desktop/DIV2K_train_HR'
     val_hr_dir = 'C:/Users/Admin/Desktop/DIV2K_valid_HR'
 
     # Datensatz und DataLoader
-    train_dataset = DIV2KDataset(train_hr_dir, transform=transform)
-    val_dataset = DIV2KDataset(val_hr_dir, transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4)
-   
+    train_dataset = DIV2KDataset(train_hr_dir, crop_size=256)
+    val_dataset = DIV2KDataset(val_hr_dir, crop_size=256)
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4, collate_fn=custom_collate)
+    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4, collate_fn=custom_collate)
+  
     # Modell auswählen
     model = FreeFormFlowUpscaler(SimpleConvEncoder(), SimpleConvDecoder()).to(device)
-    model.apply(init_weights)
+   # model.apply(init_weights)
     
     # Optimierer und Scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
     num_epochs = 50
-    scheduler = OneCycleLR(optimizer, max_lr=0.01, steps_per_epoch=len(train_loader), epochs=num_epochs)
-    scaler = GradScaler()
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.01, steps_per_epoch=len(train_loader), epochs=num_epochs)
+
+        # GradScaler für Mixed Precision Training
+    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
     
     # Training
     try:
